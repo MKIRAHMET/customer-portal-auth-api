@@ -6,6 +6,10 @@ const bodyParser = require('body-parser');
 const path = require('path');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');  // Added JWT library
+const { ValidationError, InvalidUserError, AuthenticationFailed } = require('./errors/CustomError');
+const { stringify } = require('querystring');
+const winston = require('winston');
+
 const saltRounds = 5;
 const secretKey = 'your-secret-key';  // Replace with a secure secret key
  
@@ -31,57 +35,121 @@ app.use('/static', express.static(path.join('.', 'frontend')));
 // Middleware to handle URL-encoded form data
 app.use(bodyParser.urlencoded({ extended: true }));
  
-// POST endpoint for user login with JWT authentication
-app.post('/api/login', async (req, res) => {
-    const data = req.body;
-    console.log(data);
- 
-    const user_name = data['user_name'];
-    const password = data['password'];
- 
-    const user = usersdic[user_name];
-    if (!user || !(await bcrypt.compare(password, user.hashedpwd))) {
-        res.status(401).send('User Information incorrect');
-        return;
-    }
- 
-    // No need to print details to the terminal, just send a success message
-    res.status(200).send('Login successfully');
+// Winston logger
+const fileTransport = new winston.transports.File({ filename: 'logfile.log' });
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.timestamp(),
+        winston.format.printf(({ timestamp, level, message }) => {
+          return `${timestamp} [${level}]: ${message}`;
+        })
+      )
+    }),
+    fileTransport
+  ]
 });
- 
-// POST endpoint for adding a new customer with JWT authentication
-app.post('/api/add_customer', async (req, res) => {
-    const data = req.body;
-    console.log(data);
- 
-    const documents = await Customers.find({ user_name: data['user_name'] });
-    if (documents.length > 0) {
-        res.status(409).send('User already exists');
-        return;
+
+// POST /api/login
+app.post('/api/login', async (req, res, next) => {
+  const { user_name, password } = req.body;
+
+  try {
+    const user = await Customers.findOne({ user_name });
+    if (!user) {
+      fileTransport.log({
+        level: 'warn',
+        message: `Login failed for non-existing user: ${user_name}`,
+        timestamp: new Date().toISOString()
+      });
+      throw new InvalidUserError("No such user in database");
     }
- 
-    const hashedpwd = await bcrypt.hash(data['password'], saltRounds);
-    usersdic[data['user_name']] = { hashedpwd };
- 
-    // Creating a new instance of the Customers model with data from the request
-    const customer = new Customers({
-        user_name: data['user_name'],
-        age: data['age'],
-        password: hashedpwd,
-        email: data['email'],
-    });
- 
-    // Saving the new customer to the MongoDB 'customers' collection
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      fileTransport.log({
+        level: 'warn',
+        message: `Invalid password attempt for user: ${user_name}`,
+        timestamp: new Date().toISOString()
+      });
+      throw new AuthenticationFailed("Passwords don't match");
+    }
+
+    const token = jwt.sign({ id: user._id, user_name: user.user_name }, secretKey, { expiresIn: '1h' });
+    res.json({ message: "User Logged In", token });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/add_customer
+app.post('/api/add_customer', async (req, res, next) => {
+  const { user_name, age, password, email } = req.body;
+
+  try {
+    // Validations
+    if (isNaN(parseInt(age, 10)) || parseInt(age, 10) < 21) {
+      throw new ValidationError("Customer under required age limit");
+    }
+    if (typeof user_name !== 'string' || user_name.trim() === '') {
+      throw new ValidationError("Name must be a non-empty string");
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      throw new ValidationError("Password must be at least 6 characters");
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new ValidationError("Invalid email format");
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Create and save
+    const customer = new Customers({ user_name, age, password: hashedPassword, email });
     await customer.save();
- 
-    res.status(201).send('Customer added successfully');
+
+    logger.info(`Customer added: ${user_name}`);
+    res.status(201).send("Customer added successfully");
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      fileTransport.log({
+        level: 'warn',
+        message: `Validation error for username: ${user_name} - ${error.message}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    next(error);
+  }
 });
+
+
+
  
 // GET endpoint for the root URL, serving the home page
 app.get('/', async (req, res) => {
     res.sendFile(path.join(__dirname, 'frontend', 'home.html'));
 });
+
+app.use((err,req,res,next) => {
+    err.statusCode = err.statusCode || 500;
+    err.status = err.status || "Error";
+    console.log(err.stack);
+    res.status(err.statusCode).json({
+        status: err.statusCode,
+        message: err.message,
+    });
+})
  
+app.all("*",(req,res,next)=>{
+    const err = new Error(`Cannot find the URL ${req.originalUrl} in this application. Please check.`);
+    err.status = "Endpoint Failure";
+    err.statusCode = 404;
+    next(err);
+})
 // Function to authenticate JWT token
 function authenticateToken(req, res, next) {
     const token = req.headers['authorization'];
@@ -102,6 +170,12 @@ function authenticateToken(req, res, next) {
     });
 }
  
+// GET endpoint for user logout
+app.get('/api/logout', async (req, res) => {
+    res.cookie('username', '', { expires: new Date(0) });
+    res.redirect('/');
+});
+
 // Starting the server and listening on the specified port
 app.listen(port, () => {
     console.log(`Server is running on http://localhost:${port}`);
